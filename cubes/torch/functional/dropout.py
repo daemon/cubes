@@ -37,13 +37,13 @@ class GradedDropoutFunction(Function):
         return grad
 
 
-def main():
-    fn = GradedDropoutFunction(20, 40)
-    x = torch.ones(1, 40, 5).cuda()
-    x.requires_grad = True
-    t = fn(x).sum()
-    t.backward()
-
-
-if __name__ == "__main__":
-    main()
+def graded_dropout(x, a=0, b=None, training=False):
+    if not training:
+        return x
+    if b is None:
+        b = x.size(1)
+    if x.is_cuda:
+        fn = GradedDropoutFunction(a, b)
+        return fn(x)
+    else:
+        raise ValueError("Non-CUDA unsupported for now")
