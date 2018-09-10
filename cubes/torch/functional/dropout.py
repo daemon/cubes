@@ -22,13 +22,15 @@ class GradedDropoutFunction(Function):
     def forward(self, x):
         if self.curr_u is None or not self.tied:
             self.curr_u = min(random.randint(self.a, self.b), x.size(1))
+        old_view = x.size()
+        x = x.view(x.size(0), x.size(1), -1)
         u = self.curr_u
         grid = (x.size(0), math.ceil(x.size(2) / 64))
         block = (1, 64, 1)
         self.cube.graded_dropout_fwd_bwd(*cubes.wrap(x), self.a, self.b, u, *x.size(),
             grid=grid, block=block, stream=torch.cuda.current_stream().cuda_stream)
         torch.cuda.synchronize()
-        return x
+        return x.view(*old_view)
 
     def reset(self):
         self.curr_u = None
@@ -38,10 +40,12 @@ class GradedDropoutFunction(Function):
         grid = (grad.size(0), math.ceil(grad.size(2) / 64))
         block = (1, 64, 1)
         grad = grad.clone() # needs fresh data pointer
+        old_view = grad.size()
+        grad = grad.view(grad.size(0), grad.size(1), -1)
         self.cube.graded_dropout_fwd_bwd(*cubes.wrap(grad), self.a, self.b, u, *grad.size(),
             grid=grid, block=block, stream=torch.cuda.current_stream().cuda_stream)
         torch.cuda.synchronize()
-        return grad
+        return grad.view(*old_view)
 
 
 class GradedDropoutModule(nn.Module):
