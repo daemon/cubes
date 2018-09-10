@@ -1,1 +1,1 @@
-cubes/cuda/*.cu
+include cubes/cuda/*.cu
