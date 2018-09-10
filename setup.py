@@ -7,7 +7,7 @@ setuptools.setup(
     author="Ralph Tang",
     author_email="r33tang@uwaterloo.ca",
     description="CUDA kernels with Python bindings for deep learning applications.",
-    install_requires=["pycuda"],
+    install_requires=["pynvrtc"],
     url="https://github.com/daemon/cubes",
     packages=setuptools.find_packages(),
     classifiers=(

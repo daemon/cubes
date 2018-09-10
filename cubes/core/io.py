@@ -1,20 +1,12 @@
+import functools
 import os
 
-from pycuda.compiler import SourceModule
-from pycuda.driver import PointerHolderBase
-import pycuda.driver as drv
-import pycuda.autoinit
+from collections import namedtuple
+from cupy.cuda import function
+from pynvrtc.compiler import Program
 
 
-class PointerWrapper(PointerHolderBase):
-
-    def __init__(self, pointer):
-        super().__init__()
-        self.gpudata = pointer
-        self.pointer = pointer
-
-    def get_pointer(self):
-        return self.pointer
+Stream = namedtuple("Stream", "ptr")
 
 
 class Cube(object):
@@ -25,7 +17,8 @@ class Cube(object):
             self.function = function
 
         def __call__(self, *args, **kwargs):
-            self.function(*args, **kwargs)
+            kwargs["stream"] = Stream(kwargs["stream"])
+            self.function(args=args, **kwargs)
 
     def __init__(self, src_module):
         self.src_module = src_module
@@ -34,18 +27,23 @@ class Cube(object):
         return self.CubeFunction(self.src_module.get_function(name))
 
 
+@functools.lru_cache(maxsize=1024)
 def load(filename):
     filename = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cuda", filename)
     with open(filename) as f:
-        return loads(f.read())
+        return loads(f.read(), os.path.basename(filename))
 
 
-def loads(kernel_str):
-    return Cube(SourceModule(kernel_str))
+def loads(kernel_str, kernel_name):
+    program = Program(kernel_str, kernel_name)
+    ptx = program.compile()
+    src_module = function.Module()
+    src_module.load(bytes(ptx.encode()))
+    return Cube(src_module)
 
 
 def wrap(*args, origin="pytorch"):
     if origin == "pytorch":
-        return [PointerWrapper(x.data_ptr()) for x in args]
+        return [x.data_ptr() for x in args]
     else:
         raise ValueError("Origin must be PyTorch.")
