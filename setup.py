@@ -8,6 +8,7 @@ setuptools.setup(
     author_email="r33tang@uwaterloo.ca",
     description="CUDA kernels with Python bindings for deep learning applications.",
     install_requires=["pynvrtc"],
+    include_package_data=True,
     url="https://github.com/daemon/cubes",
     packages=setuptools.find_packages(),
     classifiers=(
