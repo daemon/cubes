@@ -11,56 +11,55 @@ import cubes
 
 class GradedDropoutFunction(Function):
 
-    def __init__(self, a, b, tied=False):
-        super().__init__()
-        self.a = a
-        self.b = b
-        self.curr_u = None
-        self.tied = tied
-        self.cube = cubes.load("graded_dropout.cu")
-
-    def forward(self, x):
-        if self.curr_u is None or not self.tied:
-            self.curr_u = min(random.randint(self.a, self.b), x.size(1))
-        old_view = x.size()
-        x = x.view(x.size(0), x.size(1), -1)
-        u = self.curr_u
-        grid = (x.size(0), math.ceil(x.size(2) / 64))
+    @staticmethod
+    def forward(ctx, x, options):
+        ctx.options = options
+        if options.get("u") is None or not options["tied"]:
+            options["u"] = min(random.randint(options["a"], options["b"]), x.size(1))
+        if not options["inplace"]:
+            x = x.clone().detach()
+        u = options["u"]
+        bsz, csz, hsz = x.size(0), x.size(1), np.prod(x.size()[2:])
+        grid = (x.size(0), math.ceil(hsz / 64))
         block = (1, 64, 1)
-        self.cube.graded_dropout_fwd_bwd(*cubes.wrap(x), self.a, self.b, u, *x.size(),
+        cube = cubes.load("graded_dropout.cu")
+        cube.graded_dropout_fwd_bwd(*cubes.wrap(x), options["a"], options["b"], u, bsz, csz, hsz,
             grid=grid, block=block, stream=torch.cuda.current_stream().cuda_stream)
-        torch.cuda.synchronize()
-        return x.view(*old_view)
+        return x
 
-    def reset(self):
-        self.curr_u = None
-
-    def backward(self, grad):
-        u = self.curr_u
-        grid = (grad.size(0), math.ceil(grad.size(2) / 64))
+    @staticmethod
+    def backward(ctx, grad):
+        options = ctx.options
+        u = options["u"]
+        bsz, csz, hsz = grad.size(0), grad.size(1), np.prod(grad.size()[2:])
+        grid = (grad.size(0), math.ceil(hsz / 64))
         block = (1, 64, 1)
-        grad = grad.clone() # needs fresh data pointer
-        old_view = grad.size()
-        grad = grad.view(grad.size(0), grad.size(1), -1)
-        self.cube.graded_dropout_fwd_bwd(*cubes.wrap(grad), self.a, self.b, u, *grad.size(),
+        grad = grad.clone().detach() # needs fresh data pointer
+        cube = cubes.load("graded_dropout.cu")
+        cube.graded_dropout_fwd_bwd(*cubes.wrap(grad), options["a"], options["b"], u, bsz, csz, hsz,
             grid=grid, block=block, stream=torch.cuda.current_stream().cuda_stream)
-        torch.cuda.synchronize()
-        return grad.view(*old_view)
+        return grad, None
 
 
 class GradedDropoutModule(nn.Module):
 
-    def __init__(self, a, b, tied=False):
+    def __init__(self, a, b, tied=False, inplace=False, eval_u=None):
         super().__init__()
         self.a = a
         self.b = b
-        self.fn = GradedDropoutFunction(a, b, tied=tied)
+        self.eval_u = eval_u
+        self.options = dict(u=None, tied=tied, a=a, b=b, inplace=inplace)
 
     def reset(self):
-        self.fn.reset()
+        self.options["u"] = None
 
     def forward(self, x):
-        return self.fn(x)
+        if not self.training and self.eval_u is None:
+            return x
+        if self.eval_u is not None and not self.training:
+            self.options["u"] = self.eval_u
+            self.options["tied"] = True
+        return GradedDropoutFunction.apply(x, self.options)
 
 
 def graded_dropout(x, a=0, b=None, training=False):
