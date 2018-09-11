@@ -29,7 +29,7 @@ class Cube(object):
 
 @functools.lru_cache(maxsize=1024)
 def load(filename):
-    filename = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cuda", filename)
+    filename = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cuda", filename))
     with open(filename) as f:
         return loads(f.read(), os.path.basename(filename))
 
