@@ -12,18 +12,23 @@ import cubes
 class L0WeightTransformFunction(Function):
 
     @staticmethod
-    def forward(ctx, weights, log_alpha, beta, gamma, zeta):
+    def forward(ctx, weights, log_alpha, beta, gamma, zeta, is_training):
         cube = cubes.load("l0_sparsity.cu")
         ctx.hyperparams = beta, gamma, zeta
         csz, gsz = weights.size(0), np.prod(weights.size()[1:])
         grid = (math.ceil(csz / 16), math.ceil(gsz / 16))
         block = (16, 16, 1)
         out_weights = weights.new(*weights.size())
-        uniform = log_alpha.new(*log_alpha.size()).uniform_()
-        cube.l0_weights_fwd(*cubes.wrap(out_weights, weights, log_alpha, uniform), np.float32(beta),
-            np.float32(gamma), np.float32(zeta), csz, gsz, grid=grid, block=block,
-            stream=torch.cuda.current_stream().cuda_stream)
-        ctx.save_for_backward(weights, log_alpha, uniform)
+        if is_training:
+            uniform = log_alpha.new(*log_alpha.size()).uniform_()
+            cube.l0_weights_fwd(*cubes.wrap(out_weights, weights, log_alpha, uniform), np.float32(beta),
+                np.float32(gamma), np.float32(zeta), csz, gsz, grid=grid, block=block,
+                stream=torch.cuda.current_stream().cuda_stream)
+            ctx.save_for_backward(weights, log_alpha, uniform)
+        else:
+            cube.l0_weights_test_fwd(*cubes.wrap(out_weights, weights, log_alpha), np.float32(beta),
+                np.float32(gamma), np.float32(zeta), csz, gsz, grid=grid, block=block,
+                stream=torch.cuda.current_stream().cuda_stream)
         return out_weights
 
     @staticmethod
@@ -41,7 +46,7 @@ class L0WeightTransformFunction(Function):
             log_alpha, uniform), np.float32(beta), np.float32(gamma), np.float32(zeta), csz, gsz,
             grid=grid, block=block, stream=torch.cuda.current_stream().cuda_stream)
         out_log_alpha_grad = out_log_alpha_grad.view(log_alpha.size(0), -1)
-        return out_weights_grad, out_log_alpha_grad.sum(1), None, None, None
+        return out_weights_grad, out_log_alpha_grad.sum(1), None, None, None, None
 
 
 class L0NormFunction(Function):
@@ -90,11 +95,25 @@ class L0Linear(nn.Module):
         return l0_norm(self.linear.weight, self.log_alpha, *self.hyperparams).sum() + \
             l0_norm(self.linear.bias.unsqueeze(-1), self.log_alpha, *self.hyperparams).sum()
 
+    @property
+    def n_gates(self):
+        return self.log_alpha.numel()
+
+    def count_active(self):
+        _, gamma, zeta = self.hyperparams
+        return ((self.log_alpha.sigmoid() * (zeta - gamma) + gamma).clamp_(min=0) != 0).long().sum()
+
+    def _transform_weight(self):
+        return l0_weight_transform(self.linear.weight, self.log_alpha, *self.hyperparams, self.training)
+
+    def _transform_bias(self):
+        return l0_weight_transform(self.linear.bias.unsqueeze(-1), self.log_alpha, *self.hyperparams, self.training).squeeze(-1)
+
     def forward(self, x):
-        weight = l0_weight_transform(self.linear.weight, self.log_alpha, *self.hyperparams)
+        weight = self._transform_weight()
         bias = None
         if self.linear.bias is not None:
-            bias = l0_weight_transform(self.linear.bias.unsqueeze(-1), self.log_alpha, *self.hyperparams).squeeze(-1)
+            bias = self._transform_bias()
         return F.linear(x, weight, bias=bias)
 
 
@@ -116,11 +135,25 @@ class L0Conv2d(nn.Module):
         return l0_norm(self.conv.weight, self.log_alpha, *self.hyperparams).sum() + \
             l0_norm(self.conv.bias.unsqueeze(-1), self.log_alpha, *self.hyperparams).sum()
 
+    @property
+    def n_gates(self):
+        return self.log_alpha.numel()
+
+    def count_active(self):
+        _, gamma, zeta = self.hyperparams
+        return ((self.log_alpha.sigmoid() * (zeta - gamma) + gamma).clamp_(min=0) != 0).long().sum()
+
+    def _transform_weight(self):
+        return l0_weight_transform(self.conv.weight, self.log_alpha, *self.hyperparams, self.training)
+
+    def _transform_bias(self):
+        return l0_weight_transform(self.conv.bias.unsqueeze(-1), self.log_alpha, *self.hyperparams, self.training).squeeze(-1)
+
     def forward(self, x):
-        weight = l0_weight_transform(self.conv.weight, self.log_alpha, *self.hyperparams)
+        weight = self._transform_weight()
         bias = None
         if self.conv.bias is not None:
-            self.kwargs["bias"] = l0_weight_transform(self.conv.bias.unsqueeze(-1), self.log_alpha, *self.hyperparams).squeeze(-1)
+            self.kwargs["bias"] = self._transform_bias()
         return F.conv2d(x, weight, **self.kwargs)
 
 

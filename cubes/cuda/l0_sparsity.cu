@@ -15,6 +15,22 @@ __device__ __forceinline__ float training_q_bwd(const float log_alpha, const flo
 }
 
 extern "C"
+__device__ __forceinline__ float test_q_fwd(const float log_alpha, const float beta, const float gamma, const float zeta) {
+    return min(1.0f, max(0.0f, sigmoid_f(log_alpha) * (zeta - gamma) + gamma));
+}
+
+extern "C"
+__global__ void l0_weights_test_fwd(float *out_weights, const float *in_weights, const float *log_alpha,
+        const float beta, const float gamma, const float zeta, const int channel_size, const int group_size) {
+    int cid = blockIdx.x * blockDim.x + threadIdx.x;
+    int gid = blockIdx.y * blockDim.y + threadIdx.y;
+    if (cid >= channel_size || gid >= group_size)
+        return;
+    int idx = cid * group_size + gid;
+    out_weights[idx] = test_q_fwd(log_alpha[cid], beta, gamma, zeta) * in_weights[idx];
+}
+
+extern "C"
 __global__ void l0_norm_fwd(float *out_norm, const float *log_alpha, const float beta, const float gamma, const float zeta, 
         const int channel_size, const int group_size) {
     int cid = blockIdx.x * blockDim.x + threadIdx.x;
