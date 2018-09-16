@@ -31,21 +31,31 @@ __global__ void l0_weights_test_fwd(float *out_weights, const float *in_weights,
 }
 
 extern "C"
-__global__ void l0_norm_fwd(float *out_norm, const float *log_alpha, const float beta, const float gamma, const float zeta, 
+__global__ void l0_norm_fwd(float *out_norm, const float *log_alpha, const float *weights, const float weight_decay, const float beta, const float gamma, const float zeta, 
         const int channel_size, const int group_size) {
     int cid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (cid >= channel_size)
+    int gid = blockIdx.y * blockDim.y + threadIdx.y;
+    if (cid >= channel_size || gid >= group_size)
         return;
-    out_norm[cid] = group_size * training_q_fwd(log_alpha[cid], beta, gamma, zeta);
+    int idx = cid * group_size + gid;
+    if (weight_decay == 0.0f) {
+        out_norm[cid] = group_size * training_q_fwd(log_alpha[cid], beta, gamma, zeta);
+    } else {
+        float norm = training_q_fwd(log_alpha[cid], beta, gamma, zeta) * (0.5 * weights[idx] * weights[idx] * weight_decay + 1);
+        atomicAdd(out_norm + cid, norm);
+    }
 }
 
 extern "C"
-__global__ void l0_norm_bwd(float *out_norm_grad, const float *in_norm_grad, const float *log_alpha, const float beta, const float gamma, const float zeta, 
-        const int channel_size, const int group_size) {
+__global__ void l0_norm_bwd(float *out_norm_grad, const float *in_norm_grad, const float *log_alpha, float *weight_grad, const float *weights, const float weight_decay,
+        const float beta, const float gamma, const float zeta, const int channel_size, const int group_size) {
     int cid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (cid >= channel_size)
+    int gid = blockIdx.y * blockDim.y + threadIdx.y;
+    if (cid >= channel_size || gid >= group_size)
         return;
-    out_norm_grad[cid] = group_size * training_q_bwd(log_alpha[cid], beta, gamma, zeta) * in_norm_grad[cid];
+    int idx = cid * group_size + gid;
+    atomicAdd(out_norm_grad + cid, (0.5 * weights[idx] * weights[idx] * weight_decay + 1) * training_q_bwd(log_alpha[cid], beta, gamma, zeta) * in_norm_grad[0]);
+    weight_grad[idx] = training_q_fwd(log_alpha[cid], beta, gamma, zeta) * in_norm_grad[0] * weights[idx] * weight_decay;
 }
 
 extern "C"

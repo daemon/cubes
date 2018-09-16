@@ -16,8 +16,8 @@ class L0WeightTransformFunction(Function):
         cube = cubes.load("l0_sparsity.cu")
         ctx.hyperparams = beta, gamma, zeta
         csz, gsz = weights.size(0), np.prod(weights.size()[1:])
-        grid = (math.ceil(csz / 16), math.ceil(gsz / 16))
-        block = (16, 16, 1)
+        grid = (math.ceil(csz / 32), math.ceil(gsz / 32))
+        block = (min(32, csz), min(32, gsz), 1)
         out_weights = weights.new(*weights.size())
         if is_training:
             uniform = log_alpha.new(*log_alpha.size()).uniform_()
@@ -37,8 +37,8 @@ class L0WeightTransformFunction(Function):
         weights, log_alpha, uniform = ctx.saved_variables
         beta, gamma, zeta = ctx.hyperparams
         csz, gsz = weights_grad.size(0), np.prod(weights_grad.size()[1:])
-        grid = (math.ceil(csz / 16), math.ceil(gsz / 16))
-        block = (16, 16, 1)
+        grid = (math.ceil(csz / 32), math.ceil(gsz / 32))
+        block = (min(32, csz), min(32, gsz), 1)
         weights_grad = weights_grad.clone().detach() # needs fresh data pointer
         out_weights_grad = weights_grad.new(*weights_grad.size())
         out_log_alpha_grad = weights_grad.new(*weights_grad.size())
@@ -52,30 +52,31 @@ class L0WeightTransformFunction(Function):
 class L0NormFunction(Function):
 
     @staticmethod
-    def forward(ctx, weights, log_alpha, beta, gamma, zeta):
+    def forward(ctx, weights, log_alpha, weight_decay, beta, gamma, zeta):
         cube = cubes.load("l0_sparsity.cu")
         csz, gsz = weights.size(0), np.prod(weights.size()[1:])
-        ctx.hyperparams = beta, gamma, zeta, csz, gsz
-        grid = (math.ceil(csz / 64), 1)
-        block = (64, 1, 1)
-        out_norm = log_alpha.new(*log_alpha.size())
-        cube.l0_norm_fwd(*cubes.wrap(out_norm, log_alpha), np.float32(beta), np.float32(gamma), 
+        ctx.hyperparams = weight_decay, beta, gamma, zeta, csz, gsz
+        grid = (math.ceil(csz / 32), math.ceil(gsz / 32))
+        block = (min(32, csz), min(32, gsz), 1)
+        ctx.save_for_backward(log_alpha, weights)
+        out_norm = log_alpha.new(*log_alpha.size()).zero_()
+        cube.l0_norm_fwd(*cubes.wrap(out_norm, log_alpha, weights), np.float32(weight_decay), np.float32(beta), np.float32(gamma), 
             np.float32(zeta), csz, gsz, grid=grid, block=block, stream=torch.cuda.current_stream().cuda_stream)
-        ctx.save_for_backward(log_alpha)
-        return out_norm
+        return out_norm.sum()
 
     @staticmethod
     def backward(ctx, norm_grad):
         cube = cubes.load("l0_sparsity.cu")
-        beta, gamma, zeta, csz, gsz = ctx.hyperparams
-        grid = (math.ceil(csz / 64), 1)
-        block = (64, 1, 1)
-        log_alpha, = ctx.saved_variables
+        weight_decay, beta, gamma, zeta, csz, gsz = ctx.hyperparams
+        grid = (math.ceil(csz / 32), math.ceil(gsz / 32))
+        block = (min(32, csz), min(32, gsz), 1)
+        log_alpha, weights = ctx.saved_variables
         norm_grad = norm_grad.clone().detach() # needs fresh data pointer
-        out_norm_grad = log_alpha.new(*log_alpha.size())
-        cube.l0_norm_bwd(*cubes.wrap(out_norm_grad, norm_grad, log_alpha), np.float32(beta), np.float32(gamma),
+        out_norm_grad = log_alpha.new(*log_alpha.size()).zero_()
+        weight_grad = weights.new(*weights.size())
+        cube.l0_norm_bwd(*cubes.wrap(out_norm_grad, norm_grad, log_alpha, weight_grad, weights), np.float32(weight_decay), np.float32(beta), np.float32(gamma),
             np.float32(zeta), csz, gsz, grid=grid, block=block, stream=torch.cuda.current_stream().cuda_stream)
-        return None, out_norm_grad, None, None, None
+        return weight_grad, out_norm_grad, None, None, None, None
 
 
 l0_weight_transform = L0WeightTransformFunction.apply
@@ -84,16 +85,29 @@ l0_norm = L0NormFunction.apply
 
 class L0Linear(nn.Module):
 
-    def __init__(self, *args, beta=2/3, gamma=-0.1, zeta=1.1):
+    def __init__(self, *args, dropout_prob=0.5, beta=2/3, gamma=-0.1, zeta=1.1, dummy=False, weight_decay=5E-4):
         super().__init__()
+        self.weight_decay = weight_decay
         self.hyperparams = beta, gamma, zeta
         self.linear = nn.Linear(*args)
-        self.log_alpha = nn.Parameter(torch.empty(self.linear.weight.size(0)).normal_(0, 0.01))
+        log_alpha = math.log(1 - dropout_prob) - math.log(dropout_prob)
+        self.dummy = dummy
+        if dummy:
+            self.linear.weight.requires_grad = False
+            self.linear.bias.requires_grad = False
+            self.linear.weight.data = torch.eye(self.linear.weight.size(0), self.linear.weight.size(1))
+            self.linear.bias.data.zero_()
+        self.log_alpha = nn.Parameter(torch.empty(self.linear.weight.size(0)).normal_(log_alpha, 0.01))
 
     @property
     def l0_norm(self):
-        return l0_norm(self.linear.weight, self.log_alpha, *self.hyperparams).sum() + \
-            l0_norm(self.linear.bias.unsqueeze(-1), self.log_alpha, *self.hyperparams).sum()
+        factor = 1
+        if self.dummy:
+            factor = self.linear.weight.size(0)
+        norm = l0_norm(self.linear.weight, self.log_alpha, self.weight_decay, *self.hyperparams).sum()
+        if self.linear.bias is not None and not self.dummy:
+            norm += l0_norm(self.linear.bias.unsqueeze(-1), self.log_alpha, self.weight_decay, *self.hyperparams).sum()
+        return norm / factor
 
     @property
     def n_gates(self):
@@ -121,9 +135,15 @@ class L0Conv2d(nn.Module):
 
     def __init__(self, *args, **kwargs):
         super().__init__()
+        self.weight_decay = kwargs.get("weight_decay", 5E-4)
         self.hyperparams = kwargs.get("beta", 2/3), kwargs.get("gamma", -0.1), kwargs.get("zeta", 1.1)
+        log_alpha = math.log(1 - kwargs.get("dropout_prob", 0.5)) - math.log(kwargs.get("dropout_prob", 0.5))
+        try:
+            del kwargs["dropout_prob"]
+        except KeyError:
+            pass
         self.conv = nn.Conv2d(*args, **kwargs)
-        self.log_alpha = nn.Parameter(torch.empty(self.conv.weight.size(0)).normal_(0, 0.01))
+        self.log_alpha = nn.Parameter(torch.empty(self.conv.weight.size(0)).normal_(log_alpha, 0.01))
         self.kwargs = kwargs
         try:
             del self.kwargs["kernel_size"]
@@ -132,8 +152,8 @@ class L0Conv2d(nn.Module):
 
     @property
     def l0_norm(self):
-        return l0_norm(self.conv.weight, self.log_alpha, *self.hyperparams).sum() + \
-            l0_norm(self.conv.bias.unsqueeze(-1), self.log_alpha, *self.hyperparams).sum()
+        return l0_norm(self.conv.weight, self.log_alpha, self.weight_decay, *self.hyperparams).sum() + \
+            l0_norm(self.conv.bias.unsqueeze(-1), self.log_alpha, self.weight_decay, *self.hyperparams).sum()
 
     @property
     def n_gates(self):
@@ -196,7 +216,7 @@ if __name__ == "__main__":
     weights = torch.ones(10, 320).cuda()
     weights.requires_grad = True
     print("old weights:", weights[:, 0])
-    gated_weights = l0_weight_transform(weights, log_alpha, 2/3, -0.1, 1.1)
+    gated_weights = l0_weight_transform(weights, log_alpha, 2/3, -0.1, 1.1, True)
     print("gated weights:", gated_weights[:, 0])
     y = F.linear(gated_weights, torch.ones(1, 320).cuda())
     y.sum().backward()
