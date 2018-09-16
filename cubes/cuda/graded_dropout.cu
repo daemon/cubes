@@ -6,15 +6,15 @@ __global__ void graded_dropout_fwd_bwd(float *in_tensor, int a, int b, int u, in
     if (bid >= batch_size || hid >= hid_size)
         return;
     float p_hat = 0;
-    // float dp = 1.0 / (b - a + 1);
+    float dp = 1.0 / (b - a + 1);
     for (int cid = a; cid < channel_size; ++cid) {
         int idx = bid * channel_size * hid_size + cid * hid_size + hid;
         if (cid >= u) {
             in_tensor[idx] = 0;
             continue;
         }
-        // if (p_hat < 1 - dp)
-        //     p_hat += dp;
-        // in_tensor[idx] *= 1 / (1 - p_hat);
+        if (p_hat < 1 - dp)
+            p_hat += dp;
+        in_tensor[idx] *= 1 / (1 - p_hat);
     }
 }
